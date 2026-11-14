@@ -4,8 +4,10 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 export function request(path: string, init?: RequestInit): Promise<Response> {
   const url = path.startsWith('http') ? path : `${API_BASE}${path}`
   return fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
+    // 列表与详情始终回源，避免旧值残留
+    cache: 'no-store',
     ...init,
+    headers: { 'Content-Type': 'application/json', ...init?.headers },
   }).catch((error: unknown) => {
     const detail = error instanceof Error ? error.message : '请求未送达'
     throw new Error(`接口请求失败：${detail}`)

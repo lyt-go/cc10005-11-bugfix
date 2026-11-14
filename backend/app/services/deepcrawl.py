@@ -1,61 +1,61 @@
-"""深度爬取业务规则：状态流转、字段校验与筛选口径都收在这里。"""
+"""深度爬取业务规则：爬虫配置的启用与暂停直接决定抓取队列可用性。
+
+暂停最后一份已启用配置时，抓取中的种子退回待抓取并冻结检查点；
+恢复时按暂停批次认领执行权，并发恢复同一批种子只有一个批次成功。
+"""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ContextManager
 
-from app.store import store
+from app.services.base import BaseEntryService, ModuleSpec
+from app.services.crawl_runtime import get_runtime
 
-MODULE = "deepcrawl"
-REQUIRED_FIELDS = ["配置编号", "种子URL", "最大深度"]
-STATUS_ORDER = ["草稿", "策略评审中", "已启用", "已暂停"]
-ACTION_RULES = {"提交策略评审": "策略评审中", "启用爬取": "已启用", "暂停爬取": "已暂停"}
-NEGATIVE_ACTIONS = []
+SPEC = ModuleSpec(
+    module="deepcrawl",
+    entity="爬虫配置",
+    label="深度爬取",
+    required_fields=("配置编号", "种子URL", "最大深度"),
+    status_order=("草稿", "策略评审中", "已启用", "已暂停"),
+    action_rules={"提交策略评审": "策略评审中", "启用爬取": "已启用", "暂停爬取": "已暂停"},
+    transitions={
+        "提交策略评审": ("草稿",),
+        "启用爬取": ("策略评审中", "已暂停"),
+        "暂停爬取": ("已启用",),
+    },
+    pending_off=("已启用", "已暂停"),
+)
 
 
-class DeepcrawlService:
-    def list_entries(
-        self,
-        *,
-        keyword: str | None = None,
-        status: str | None = None,
-        page: int = 1,
-        size: int = 20,
-    ) -> tuple[list[dict[str, Any]], int]:
-        rows = store.rows(MODULE)
-        if keyword:
-            rows = [row for row in rows if keyword in str(row.get("配置编号", ""))]
-        if status:
-            rows = [row for row in rows if row.get("status") == status]
-        total = len(rows)
-        start = max(page - 1, 0) * size
-        return rows[start:start + size], total
+class DeepcrawlService(BaseEntryService):
+    spec = SPEC
 
-    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
-        return store.find(MODULE, entry_id)
+    def action_guard(self) -> ContextManager[None]:
+        # 暂停/恢复要和抓取队列一起落账，全程在运行时锁内
+        return get_runtime().guard()
 
-    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
-        missing = [field for field in REQUIRED_FIELDS if not str(values.get(field) or "").strip()]
-        if missing:
-            return None, missing
-        rows = store.rows(MODULE)
-        entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
-        entry.update({field: values.get(field) for field in REQUIRED_FIELDS})
-        entry["status"] = STATUS_ORDER[0]
-        entry["pending"] = True
-        entry["abnormal"] = False
-        rows.append(entry)
-        return entry, []
+    def transition_blocked(self, entry: dict[str, Any], action: str) -> str:
+        status = entry.get("status")
+        if action == "暂停爬取":
+            return f"爬虫配置当前为「{status}」，只有已启用的配置才能暂停"
+        if action == "启用爬取":
+            if status == "已启用":
+                return "爬虫配置已启用，同一批种子只能由一个批次恢复"
+            return f"爬虫配置当前为「{status}」，请先完成策略评审"
+        return super().transition_blocked(entry, action)
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
-        entry = store.find(MODULE, entry_id)
-        if entry is None:
-            return None, f"爬虫配置 {entry_id} 不存在或已归档"
-        if action not in ACTION_RULES:
-            return None, f"动作「{action}」不属于深度爬取可执行范围"
-        target = ACTION_RULES[action]
-        if target not in STATUS_ORDER:
-            return None, f"目标状态「{target}」不在允许的状态序列里"
-        entry["status"] = target
-        entry["pending"] = target != STATUS_ORDER[-1]
-        entry["abnormal"] = action in NEGATIVE_ACTIONS
-        return entry, f"爬虫配置已{action}"
+    def validate_side_effects(self, entry: dict[str, Any], action: str) -> str | None:
+        if action == "启用爬取" and entry.get("status") == "已暂停":
+            return get_runtime().resume_conflict_check()
+        return None
+
+    def apply_side_effects(self, entry: dict[str, Any], action: str, previous: str) -> str | None:
+        runtime = get_runtime()
+        if action == "暂停爬取":
+            paused = runtime.pause_if_unavailable(entry)
+            if paused:
+                return f"，{paused} 个抓取中的种子已退回待抓取，检查点已冻结"
+        if action == "启用爬取" and previous == "已暂停":
+            count, token = runtime.claim_resume(entry)
+            if count:
+                return f"，批次 {token} 取得执行权，{count} 个任务从检查点续爬"
+        return None
